@@ -1,0 +1,512 @@
+# ---------------------------------------------------------------------------
+# CI du dépôt applicatif.
+#
+# Elle fait trois choses, dans cet ordre, et s'arrête à la première qui échoue :
+#
+#   1. elle éprouve le code (Pest sur PostgreSQL et Redis réels, Pint, Larastan) ;
+#   2. elle construit, analyse, signe et publie les deux images sur GHCR ;
+#   3. elle ouvre une pull request sur gitops pour faire avancer les tags.
+#
+# Elle ne parle JAMAIS au cluster et ne détient aucun kubeconfig. Le modèle
+# reste pull : ArgoCD va chercher son état, cette CI se contente de publier une
+# image signée et de proposer un commit au dépôt qui fait foi.
+#
+# Sur une pull request, les images sont construites et analysées mais ni
+# poussées, ni signées : une pull request venant d'un fork n'obtient ni
+# `packages: write`, ni jeton OIDC, et ne peut donc rien publier.
+# ---------------------------------------------------------------------------
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Élargi tâche par tâche, jamais ici : seule `images` a besoin d'écrire dans le
+# registre et de demander un jeton OIDC.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PHP_VERSION: "8.5"
+
+  # Le tag des images. SHA COMPLET, et non abrégé : c'est la forme que
+  # DEPLOY.md et les commentaires des kustomizations de gitops documentent
+  # (`sha-$GITHUB_SHA`). La tâche `gitops` réutilise la même variable, pour
+  # qu'il n'y ait pas deux endroits où la forme du tag est décidée.
+  TAG: sha-${{ github.sha }}
+
+  # Cosign 2 et NON 3, et ce n'est pas un retard de mise à jour.
+  #
+  # En 3.x, `cosign sign` écrit un bundle Sigstore publié en référent OCI 1.1 et
+  # journalise dans Rekor v2, là où la règle verify-ghcr-openjbessa du dépôt
+  # gitops lit le tag `.sig` hérité et Rekor v1. L'image lui apparaîtrait NON
+  # SIGNÉE, et avec `required: true` + `Enforce` + `failurePolicy: Fail`, tous
+  # les pods de `ghcr.io/openjbessa/*` seraient refusés à l'admission.
+  #
+  # Le raisonnement complet, ce qui casserait exactement et la condition de
+  # sortie : docs/adr/0007-cosign-2-x-et-la-policy-kyverno.md. La borne est
+  # tenue par renovate.json (`allowedVersions: "<3"`), et l'étape
+  # « La signature satisfait la policy Kyverno » plus bas est là pour qu'un
+  # contournement se voie en CI plutôt qu'à l'admission.
+  # renovate: datasource=github-releases depName=sigstore/cosign
+  COSIGN_VERSION: v2.6.5
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Séparée des tests : une erreur de formatage ou de typage n'a aucune raison
+  # d'attendre le démarrage de PostgreSQL et de Redis. Les deux tâches partent
+  # en parallèle, celle-ci rend son verdict en quelques dizaines de secondes.
+  # -------------------------------------------------------------------------
+  qualite:
+    name: pint et larastan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          # Les mêmes que l'image de production (cf. Dockerfile, étage `base`) :
+          # Larastan résout des classes qui dépendent de leur présence.
+          extensions: intl, pdo_pgsql, pcntl, redis, zip
+          coverage: none
+
+      - name: Cache des dépendances Composer
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/composer
+          key: composer-${{ hashFiles('composer.lock') }}
+          restore-keys: composer-
+
+      - run: composer install --no-interaction --no-progress --prefer-dist
+
+      # `--test` et non `pint` tout court : la CI constate, elle ne réécrit pas.
+      - name: Formatage
+        run: vendor/bin/pint --test
+
+      - name: Analyse statique
+        run: vendor/bin/phpstan analyse --memory-limit=1G --no-progress
+
+  # -------------------------------------------------------------------------
+  # Pest sur PostgreSQL et Redis RÉELS, comme en local et comme en production.
+  # Le suite s'appuie dessus et non sur SQLite : RefreshDatabase vide une base
+  # PostgreSQL dédiée, et TestCase vide les index Redis 2 et 3 entre chaque
+  # test (tests/TestCase.php refuse de tourner sur d'autres index).
+  #
+  # ATTENTION en ajoutant une variable ici : PHPUnit ne pose une variable de
+  # `<env>` que si elle n'existe PAS déjà dans l'environnement du processus.
+  # Déclarer dans cette tâche une variable que phpunit.xml définit déjà
+  # l'écraserait silencieusement — poser `DB_DATABASE` ici, par exemple, ferait
+  # tourner la suite hors de la base de test. Ne figurent donc ci-dessous que
+  # les variables que phpunit.xml ne définit pas.
+  # -------------------------------------------------------------------------
+  tests:
+    name: pest
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        # Même version qu'en local (docker-compose.yml) et qu'en production.
+        image: postgres:16-alpine
+        env:
+          # `app_test`, le nom qu'exige phpunit.xml. En local c'est
+          # docker/postgres/10-create-test-database.sql qui la crée à côté de
+          # la base de développement ; ici, seule celle des tests existe.
+          POSTGRES_DB: app_test
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U app -d app_test"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+      DB_USERNAME: app
+      DB_PASSWORD: app
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: 6379
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          # `pcntl` n'est pas décoratif : tests/Feature/Stream/ConsumerShutdownTest
+          # lance de vrais sous-processus et leur envoie SIGQUIT, SIGTERM et
+          # SIGINT. Sans lui, la suite ne se charge même pas.
+          extensions: intl, pdo_pgsql, pcntl, redis, zip
+          coverage: none
+
+      - name: Cache des dépendances Composer
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/composer
+          key: composer-${{ hashFiles('composer.lock') }}
+          restore-keys: composer-
+
+      - run: composer install --no-interaction --no-progress --prefer-dist
+
+      # Jetable, tirée au sort à chaque exécution : rien à stocker en secret, et
+      # aucune clé en clair dans un dépôt public. Les tests chiffrent des
+      # cookies de session, ils n'ont pas besoin d'une clé stable.
+      - name: Clé applicative jetable
+        run: echo "APP_KEY=base64:$(openssl rand -base64 32)" >> "$GITHUB_ENV"
+
+      - run: php artisan test --compact
+
+  # -------------------------------------------------------------------------
+  # Les deux images du pod. Une exécution par image, en parallèle.
+  #
+  # `fail-fast: false` : si l'une échoue, on veut quand même le verdict de
+  # l'autre. La tâche `gitops` dépend des DEUX, donc rien n'est déployé tant
+  # que les deux ne sont pas vertes — les deux tags avancent ensemble ou pas du
+  # tout (cf. workloads/api/kustomization.yaml).
+  # -------------------------------------------------------------------------
+  images:
+    name: image ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    needs: [qualite, tests]
+
+    permissions:
+      contents: read
+      # Pousser sur ghcr.io/openjbessa.
+      packages: write
+      # Le jeton OIDC présenté à Fulcio. C'est LUI qui porte l'identité que la
+      # policy Kyverno vérifie ; sans cette ligne, cosign n'a pas de quoi
+      # demander un certificat et la signature keyless est impossible.
+      id-token: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: api
+            target: production
+          - image: api-nginx
+            target: nginx
+
+    env:
+      # Minuscules, imposées par GHCR. L'identité vérifiée plus bas garde en
+      # revanche la casse d'origine de l'organisation (`OpenJbessa`) : les deux
+      # chaînes ne sont pas interchangeables.
+      IMAGE: ghcr.io/openjbessa/${{ matrix.image }}
+      # Vrai partout sauf sur une pull request. Sert de garde aux étapes qui
+      # publient quelque chose.
+      PUBLIE: ${{ github.event_name != 'pull_request' }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      # Seulement quand il y a quelque chose à pousser. Sur une pull request
+      # l'image reste dans le démon local et les images de base viennent de
+      # Docker Hub : la tâche tourne alors SANS AUCUN IDENTIFIANT, et une pull
+      # request venant d'un fork est construite et analysée comme les autres.
+      - uses: docker/login-action@v4
+        if: env.PUBLIE == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pour les étiquettes OCI (source, révision, date) : ce sont elles qui
+      # rattachent le paquet GHCR à ce dépôt. Le tag lui est DONNÉ (`type=raw`)
+      # plutôt que déduit : sa forme est un contrat partagé avec gitops, décidé
+      # une seule fois, dans `env.TAG` en tête de fichier.
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+          tags: type=raw,value=${{ env.TAG }}
+
+      - uses: docker/build-push-action@v7
+        id: build
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          push: ${{ env.PUBLIE == 'true' }}
+          # Sur une pull request rien n'est poussé : l'image est chargée dans le
+          # démon local, ce qui suffit à Trivy.
+          load: ${{ env.PUBLIE != 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Sans cela, buildx publie un index d'images accompagné d'un manifeste
+          # d'attestation là où le pod attend une image simple. L'attestation de
+          # provenance de buildx ferait de plus double emploi avec la signature
+          # et le SBOM produits ci-dessous, qui eux sont vérifiables par la
+          # policy.
+          provenance: false
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+      # Le digest, et non le tag.
+      #
+      # Un tag est un alias : entre l'analyse et la signature, il pourrait
+      # désigner autre chose. Le digest désigne exactement l'octet publié —
+      # c'est lui que Trivy analyse, lui que cosign signe, et lui que Kyverno
+      # réécrira dans le pod (`mutateDigest: true`). Les trois portent ainsi sur
+      # le même artefact, ce qui est tout l'intérêt de la chaîne.
+      - name: Référence exacte de l'image
+        id: ref
+        run: |
+          if [ "$PUBLIE" = "true" ]; then
+            echo "ref=${IMAGE}@${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${IMAGE}:${TAG}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---------------------------------------------------------------------
+      # L'analyse est en DEUX étapes, et c'est délibéré.
+      #
+      # Ce qui bloque doit être actionnable. Les bases Debian et Alpine portent
+      # en permanence des CRITICAL sans correctif publié (`Status: affected`,
+      # colonne « Fixed Version » vide) : au 29/09/2026, l'image `api` en porte
+      # deux, dont un CVE de linux-libc-dev, un paquet d'en-têtes noyau qu'aucun
+      # processus du conteneur n'exécute. Les faire échouer rendrait la CI
+      # rouge en permanence, sans qu'aucune action ne puisse la reverdir — et
+      # une CI toujours rouge n'arrête plus rien.
+      #
+      # La première étape montre TOUT et ne bloque jamais ; rien n'est donc
+      # masqué. La seconde échoue sur les CRITICAL corrigés en amont, c'est-à-
+      # dire sur ceux auxquels on peut répondre — en reconstruisant l'image ou
+      # en faisant monter la base.
+      # ---------------------------------------------------------------------
+      - name: Trivy — rapport complet (n'échoue jamais)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.ref.outputs.ref }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          exit-code: "0"
+          format: table
+
+      - name: Trivy — aucun CRITICAL corrigeable
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.ref.outputs.ref }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+      # La version de Syft est celle que fige la version de l'action : un seul
+      # épinglage à tenir plutôt que deux qui peuvent diverger.
+      - name: SBOM Syft
+        uses: anchore/sbom-action@v0.24.2
+        with:
+          image: ${{ steps.ref.outputs.ref }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          artifact-name: sbom-${{ matrix.image }}.cdx.json
+
+      - uses: sigstore/cosign-installer@v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      # Aucune clé privée : Fulcio délivre un certificat éphémère à partir du
+      # jeton OIDC de la tâche, et l'identité du certificat est l'URL de ce
+      # workflow. Rien à stocker, rien à faire tourner, rien à révoquer.
+      - name: Signature keyless
+        if: env.PUBLIE == 'true'
+        run: cosign sign --yes "${{ steps.ref.outputs.ref }}"
+
+      # Le SBOM est attaché à l'image en tant qu'attestation SIGNÉE, avec la
+      # même identité que la signature. Attaché seul, il serait remplaçable par
+      # quiconque peut écrire dans le registre.
+      - name: Attestation du SBOM
+        if: env.PUBLIE == 'true'
+        run: |
+          cosign attest --yes \
+            --type cyclonedx \
+            --predicate sbom.cdx.json \
+            "${{ steps.ref.outputs.ref }}"
+
+      # ---------------------------------------------------------------------
+      # La contre-épreuve, avec exactement les critères de la règle
+      # verify-ghcr-openjbessa (gitops, platform/kyverno/policies/verify-images.yaml).
+      #
+      # Elle ne vérifie pas « une signature existe » mais « la signature que
+      # cette CI vient de produire est celle que le cluster exigera ». C'est la
+      # seule étape qui rattrape une divergence entre l'outil de signature et le
+      # vérificateur — celle-là même qui a motivé l'épinglage de cosign à la 2.x
+      # plus haut. Sans elle, la panne se découvrirait à l'admission du pod,
+      # après le merge de la pull request de déploiement.
+      #
+      # `OpenJbessa` avec ses majuscules : l'identité est une URL GitHub, qui
+      # conserve la casse, alors que la référence d'image est en minuscules.
+      # L'ancre `^` et le `/` final tiennent lieu du joker de la policy.
+      # ---------------------------------------------------------------------
+      - name: La signature satisfait la policy Kyverno
+        if: env.PUBLIE == 'true'
+        run: |
+          cosign verify \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-identity-regexp "^https://github\.com/OpenJbessa/" \
+            --rekor-url "https://rekor.sigstore.dev" \
+            "${{ steps.ref.outputs.ref }}"
+
+  # -------------------------------------------------------------------------
+  # Le seul point par lequel ce dépôt touche au déploiement : une pull request
+  # sur gitops, relue par un humain. Pas de push, pas de kubeconfig, pas de
+  # seconde source de vérité.
+  #
+  # LES TROIS TAGS AVANCENT DANS LE MÊME COMMIT. Le worker est la même image
+  # que l'API lancée avec une autre commande, et une configuration nginx d'une
+  # version avec un PHP-FPM d'une autre n'est pas garantie compatible. Séparer
+  # ces modifications en plusieurs pull requests permettrait de n'en merger
+  # qu'une.
+  #
+  # Renovate ne peut pas remplacer cette tâche, et ce n'est pas un oubli : le
+  # renovate.json de gitops désactive explicitement `ghcr.io/openjbessa/*`. Un
+  # tag qui est un SHA de commit n'a pas d'ordre comparable — Renovate n'a aucun
+  # moyen de savoir que `sha-b3f1…` succède à `sha-9ac2…`. Seule la CI qui a
+  # construit l'image sait quel tag est le nouveau.
+  # -------------------------------------------------------------------------
+  gitops:
+    name: pull request de déploiement
+    runs-on: ubuntu-latest
+    needs: images
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    # Aucun droit sur CE dépôt : tout passe par le jeton du dépôt gitops.
+    permissions: {}
+
+    steps:
+      # GITHUB_TOKEN ne vaut que pour le dépôt courant. Écrire dans gitops
+      # demande un jeton à soi : jeton d'une GitHub App, ou jeton personnel à
+      # portée fine limité à OpenJbessa/gitops avec `contents: write` et
+      # `pull-requests: write`. Rien de plus — ce jeton ne doit pas pouvoir
+      # approuver ni merger ce qu'il propose.
+      - name: Cloner gitops
+        uses: actions/checkout@v7
+        with:
+          repository: OpenJbessa/gitops
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet pyyaml
+
+      # ---------------------------------------------------------------------
+      # Et NON `kustomize edit set image`, que documentent pourtant DEPLOY.md et
+      # les commentaires des kustomizations.
+      #
+      # `kustomize edit` réécrit le fichier entier à partir de son modèle objet :
+      # il réindente toutes les listes, ajoute un `newName:` redondant, et
+      # surtout DÉPLACE LES COMMENTAIRES. Essayé sur workloads/worker, il remonte
+      # le commentaire qui explique `emitter.yaml` au-dessus de `resources:`, où
+      # il ne veut plus rien dire. Or ces fichiers sont largement commentés, et
+      # les commentaires y portent les décisions.
+      #
+      # Une pull request de déploiement ne doit montrer QUE ce qu'elle change :
+      # trois lignes `newTag:`. Tout le reste est du bruit qui rend la relecture
+      # coûteuse — et une relecture coûteuse finit par ne plus avoir lieu.
+      #
+      # Le remplacement est donc textuel, ancré sur `- name: <image>` pour
+      # n'atteindre que l'entrée visée (`api` est un préfixe de `api-nginx`,
+      # d'où le `$` de fin de ligne), puis RELU en YAML pour vérifier qu'il dit
+      # bien ce qu'on croit. Une entrée absente ou dupliquée arrête la tâche.
+      # ---------------------------------------------------------------------
+      - name: Faire avancer les tags
+        working-directory: gitops
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re, sys, yaml
+
+          tag = os.environ["TAG"]
+
+          # Les deux images du pod d'un côté ; de l'autre le worker, qui porte
+          # l'image de l'API lancée avec une autre commande et dont le tag ne
+          # doit jamais rester en arrière.
+          cibles = {
+              "workloads/api/kustomization.yaml": [
+                  "ghcr.io/openjbessa/api",
+                  "ghcr.io/openjbessa/api-nginx",
+              ],
+              "workloads/worker/kustomization.yaml": [
+                  "ghcr.io/openjbessa/api",
+              ],
+          }
+
+          for chemin, images in cibles.items():
+              f = pathlib.Path(chemin)
+              texte = f.read_text()
+
+              for image in images:
+                  motif = re.compile(
+                      rf"(^([ \t]*)-\s+name:\s*{re.escape(image)}[ \t]*$\n"
+                      rf"(?:.*\n)*?\2[ \t]+newTag:[ \t]*)\S+",
+                      re.M,
+                  )
+                  texte, n = motif.subn(rf"\g<1>{tag}", texte)
+                  if n != 1:
+                      sys.exit(f"{chemin} : {n} entrée(s) `{image}` avec un newTag, 1 attendue")
+
+              f.write_text(texte)
+
+              trouve = {
+                  i["name"]: i.get("newTag")
+                  for i in (yaml.safe_load(f.read_text()) or {}).get("images", [])
+              }
+              for image in images:
+                  if trouve.get(image) != tag:
+                      sys.exit(f"{chemin} : {image} vaut {trouve.get(image)!r} et non {tag!r}")
+              print(f"  {chemin} : {', '.join(images)} -> {tag}")
+          PY
+
+      # Une branche STABLE, et non une par commit : il n'y a jamais qu'une seule
+      # pull request de déploiement ouverte, et elle porte toujours le dernier
+      # build vert. Deux poussées coup sur coup ne laissent pas deux pull
+      # requests concurrentes derrière elles, dont on pourrait merger la plus
+      # ancienne.
+      - uses: peter-evans/create-pull-request@v8.1.1
+        with:
+          path: gitops
+          token: ${{ secrets.GITOPS_TOKEN }}
+          branch: deploiement/api
+          delete-branch: true
+          # Commits conventionnels en français, comme le reste de gitops, dont
+          # la configuration Renovate active `:semanticCommits`.
+          commit-message: "chore(api): déployer ${{ env.TAG }}"
+          title: "chore(api): déployer ${{ env.TAG }}"
+          body: |
+            Images construites, analysées et signées par
+            [cette exécution](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+
+            - `ghcr.io/openjbessa/api:${{ env.TAG }}`
+            - `ghcr.io/openjbessa/api-nginx:${{ env.TAG }}`
+
+            Commit applicatif : ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+
+            Les trois tags avancent ensemble (`workloads/api` pour les deux
+            images du pod, `workloads/worker` pour le consommateur et le
+            générateur, qui partagent l'image de l'API).
+
+            Signature vérifiée en CI avec les critères de la règle
+            `verify-ghcr-openjbessa` : émetteur
+            `https://token.actions.githubusercontent.com`, sujet sous
+            `https://github.com/OpenJbessa/`.

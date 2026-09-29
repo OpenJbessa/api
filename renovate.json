@@ -1,0 +1,61 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommits"
+  ],
+  "timezone": "Europe/Paris",
+  "schedule": ["before 6am on monday"],
+  "prConcurrentLimit": 3,
+  "prHourlyLimit": 2,
+
+  "customManagers": [
+    {
+      "description": "Versions d'outils de la CI, déclarées en env de .github/workflows/ci.yml. Elles décident d'un échec au même titre qu'une dépendance : elles sont épinglées et suivies.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/.+\\.ya?ml$/"],
+      "matchStrings": [
+        "#\\s*renovate:\\s*datasource=(?<datasource>\\S+)\\s+depName=(?<depName>\\S+)\\s*\\n\\s*\\w+:\\s*(?<currentValue>v?\\d+\\.\\d+\\.\\d+)"
+      ],
+      "versioningTemplate": "semver"
+    }
+  ],
+
+  "packageRules": [
+    {
+      "description": "Cosign RESTE EN 2.x. Voir docs/adr/0007-cosign-2-x-et-la-policy-kyverno.md. En 3.x, `cosign sign` écrit un bundle Sigstore exposé par l'API Referrers d'OCI 1.1 et journalise dans Rekor v2, là où la règle verify-ghcr-openjbessa du dépôt gitops lit le tag `.sig` hérité et Rekor v1 ; l'image lui apparaîtrait NON SIGNÉE et tous les pods ghcr.io/openjbessa/* seraient refusés à l'admission. La 3.x n'expose plus de drapeau pour revenir au format hérité. Cette borne ne se lève qu'avec la condition de sortie décrite dans l'ADR.",
+      "matchDatasources": ["github-releases"],
+      "matchPackageNames": ["sigstore/cosign"],
+      "allowedVersions": "<3",
+      "addLabels": ["adr-0007"],
+      "automerge": false
+    },
+    {
+      "description": "Les actions GitHub sont épinglées sur une majeure : une montée de majeure change les entrées et les sorties, et cette CI signe des images. Relecture obligatoire.",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["major"],
+      "automerge": false,
+      "minimumReleaseAge": "7 days"
+    },
+    {
+      "description": "Correctifs des dépendances PHP de développement : regroupés en une seule pull request hebdomadaire pour limiter le bruit sur un dépôt à un seul relecteur.",
+      "matchDepTypes": ["require-dev"],
+      "matchUpdateTypes": ["patch"],
+      "groupName": "correctifs outils de développement"
+    },
+    {
+      "description": "PHP, Laravel et Pest forment le socle : leurs majeures sont des décisions, pas des mises à jour (cf. docs/adr/0005). Elles ne fusionnent jamais seules.",
+      "matchPackageNames": ["php", "laravel/framework", "pestphp/pest"],
+      "matchUpdateTypes": ["major"],
+      "automerge": false,
+      "addLabels": ["socle"]
+    }
+  ],
+
+  "vulnerabilityAlerts": {
+    "labels": ["securite"],
+    "schedule": ["at any time"],
+    "minimumReleaseAge": null
+  }
+}
