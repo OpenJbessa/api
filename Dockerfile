@@ -179,8 +179,14 @@ CMD ["php-fpm"]
 # ---------------------------------------------------------------------------
 # nginx, conteneur annexe du pod de l'API. Écoute sur 8080, non privilégié ;
 # il n'écrit que dans /tmp (emptyDir), sa configuration est figée ici.
+#
+# 1.30 (ligne stable) et non 1.28 : l'amont ne reconstruit plus la 1.28, qui
+# reste donc sur nginx 1.28.2-r1 et OpenSSL 3.5.5-r0 alors que les correctifs
+# de CVE-2026-42945 (exécution de code arbitraire dans nginx) et de
+# CVE-2026-31789 sont publiés. La ligne 1.30 les porte. Ne pas redescendre :
+# la porte de l'analyse Trivy de la CI se referme dessus.
 # ---------------------------------------------------------------------------
-FROM nginxinc/nginx-unprivileged:1.28-alpine AS nginx
+FROM nginxinc/nginx-unprivileged:1.30-alpine AS nginx
 
 COPY docker/nginx/nginx.conf /etc/nginx/nginx.conf
 COPY docker/nginx/default.conf /etc/nginx/conf.d/default.conf
