@@ -56,7 +56,7 @@ function fromFrontend(string $clientIp = '203.0.113.10'): array
     return [
         'Origin' => 'https://jbessa.tech',
         'Referer' => 'https://jbessa.tech/demo',
-        'CF-Connecting-IP' => $clientIp,
+        'X-Forwarded-For' => $clientIp,
     ];
 }
 

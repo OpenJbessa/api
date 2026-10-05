@@ -18,7 +18,6 @@
 #   ORIGIN    origine du front      (défaut : http://localhost:3000)
 #             Elle doit figurer dans SANCTUM_STATEFUL_DOMAINS et
 #             CORS_ALLOWED_ORIGINS de l'API testée.
-#   CLIENT_IP adresse présentée au limiteur de créations (CF-Connecting-IP)
 #
 # Dépendances : bash, curl, grep. Code de sortie non nul au premier échec.
 # ---------------------------------------------------------------------------
@@ -27,7 +26,6 @@ set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://localhost:8000}"
 ORIGIN="${ORIGIN:-http://localhost:3000}"
-CLIENT_IP="${CLIENT_IP:-192.0.2.$((RANDOM % 254 + 1))}"
 
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
@@ -58,7 +56,6 @@ request() {
         --header "Origin: $ORIGIN" \
         --header "Referer: $ORIGIN/demo" \
         --header 'Accept: application/json' \
-        --header "CF-Connecting-IP: $CLIENT_IP" \
         --dump-header "$headers" \
         --output "$body" \
         --write-out '%{http_code}' \

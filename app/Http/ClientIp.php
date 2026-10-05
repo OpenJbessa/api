@@ -17,16 +17,8 @@ use Illuminate\Http\Request;
  */
 final class ClientIp
 {
-    public const HEADER = 'CF-Connecting-IP';
-
     public static function of(Request $request): string
     {
-        $forwarded = trim((string) $request->header(self::HEADER, ''));
-
-        if (filter_var($forwarded, FILTER_VALIDATE_IP) !== false) {
-            return $forwarded;
-        }
-
         return (string) $request->ip();
     }
 }
