@@ -20,7 +20,7 @@ use Throwable;
  * `code` est la clé stable sur laquelle le front décide ; `message` est fait
  * pour être affiché tel quel.
  *
- * Seules les routes du groupe `web` (OAuth, page d'accueil) gardent le rendu
+ * Seules les routes du groupe `web` (OAuth) gardent le rendu
  * HTML de Laravel : ce sont des navigations du navigateur.
  */
 final class ErrorResponses

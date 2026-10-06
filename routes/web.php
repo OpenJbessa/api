@@ -3,10 +3,6 @@
 use App\Http\Controllers\Auth\SocialAuthController;
 use Illuminate\Support\Facades\Route;
 
-Route::get('/', function () {
-    return view('welcome');
-});
-
 /*
 | Connexion OAuth à la démo. Groupe `web` : Socialite garde le paramètre
 | `state` en session. Le départ vers le fournisseur compte comme une création

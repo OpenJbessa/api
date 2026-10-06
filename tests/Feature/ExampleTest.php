@@ -1,7 +1,7 @@
 <?php
 
-test('the application returns a successful response', function () {
-    $response = $this->get('/');
-
-    $response->assertStatus(200);
+it('returns 404 with not_found for the root path', function (): void {
+    $this->get('/')
+        ->assertNotFound()
+        ->assertJsonPath('code', 'not_found');
 });
